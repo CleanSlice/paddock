@@ -115,6 +115,14 @@ export { buildReport } from "./report/writer"
 export type {
   EvalConfig,
   JudgeProviderConfig,
+  // Individual variants of the discriminated config union — exposed so
+  // library consumers can type narrower helper functions / mappers without
+  // re-deriving via `Extract<...>` at every use site.
+  ClaudeJudgeConfig,
+  ClaudeVertexJudgeConfig,
+  GeminiJudgeConfig,
+  GeminiVertexJudgeConfig,
+  OpenAIJudgeConfig,
   LoopState,
   Scenario,
   ScenarioCategory,

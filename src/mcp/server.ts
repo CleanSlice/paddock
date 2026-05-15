@@ -4,6 +4,7 @@ import type { EvalConfig, JudgeProviderConfig, LoopState, ScenarioCategory, Diff
 import { DEFAULT_BLOCKED_TOOLS } from "../types"
 import { loadScenarios, loadPaddockConfig } from "../scenario/loader"
 import { resolve } from "path"
+import { detectVertexMode, parseVertexJudges } from "../evaluator/providers/vertex-env"
 
 // Active orchestrator instance (one at a time)
 let activeOrchestrator: EvalOrchestrator | null = null
@@ -11,12 +12,37 @@ let lastState: LoopState | null = null
 
 function buildJudgeConfigs(): JudgeProviderConfig[] {
   const configs: JudgeProviderConfig[] = []
-  const claudeKey = process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY
-  if (claudeKey) {
-    configs.push({ type: "claude", model: "claude-sonnet-4-6", apiKey: claudeKey })
-  }
-  if (process.env.GEMINI_API_KEY) {
-    configs.push({ type: "gemini", model: "gemini-2.5-pro", apiKey: process.env.GEMINI_API_KEY })
+  // Mirrors cli.ts buildJudgeConfigs — env-to-typed-config translation.
+  // Provider classes themselves don't read env; this is the only place
+  // in the MCP entry path that does.
+  const vertex = detectVertexMode()
+  if (vertex) {
+    const explicitPanel = process.env.VERTEX_JUDGES?.trim()
+    if (explicitPanel) {
+      configs.push(...parseVertexJudges(explicitPanel, vertex))
+    } else {
+      configs.push({
+        type: "claude-vertex",
+        model: "claude-sonnet-4-6",
+        projectId: vertex.projectId,
+        region: vertex.region,
+      })
+      configs.push({
+        type: "gemini-vertex",
+        model: "gemini-2.5-pro",
+        projectId: vertex.projectId,
+        region: vertex.region,
+      })
+    }
+  } else {
+    const claudeKey = process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY
+    if (claudeKey) {
+      configs.push({ type: "claude", model: "claude-sonnet-4-6", apiKey: claudeKey })
+    }
+    const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
+    if (geminiKey) {
+      configs.push({ type: "gemini", model: "gemini-2.5-pro", apiKey: geminiKey })
+    }
   }
   if (process.env.OPENAI_API_KEY) {
     configs.push({ type: "openai", model: "gpt-4o", apiKey: process.env.OPENAI_API_KEY })

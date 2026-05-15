@@ -4,7 +4,12 @@
 
 # Paddock
 
-Automated eval & improvement loop for AI agents. Generates test scenarios, runs the agent, scores with multi-model consensus (Claude + GPT + Gemini), and iteratively patches code until quality targets are met.
+Automated eval & improvement loop for AI agents. Generates test scenarios, runs the agent, scores with multi-model consensus (Claude + Gemini + GPT), and iteratively patches code until quality targets are met.
+
+Judges run in one of two auth modes, picked per-deployment:
+
+- **Direct API** (default for public users) — Claude / Gemini / GPT via their respective vendor APIs.
+- **Vertex AI** (for compliance-aligned / GCP-aligned deployments) — Claude + Gemini via Google Cloud Vertex AI with Application Default Credentials. The GPT judge stays direct (OpenAI has no Vertex offering).
 
 ## How It Works
 
@@ -28,7 +33,7 @@ Scenarios (.yml) → Agent Runtime (mock channel) → 3 LLM Judges → Consensus
 
 1. **Load scenarios** from `.paddock/scenarios/` in the target project (YAML files organized by category)
 2. **Run each scenario** against the agent via a mock channel — captures responses, tool calls, errors, timing
-3. **3 LLM judges** (Claude, Gemini, GPT) independently score each run on correctness, tool usage, SOUL compliance, response quality, error handling
+3. **Up to 3 LLM judges** (Claude, Gemini, GPT) — registered based on which auth paths are configured — independently score each run on correctness, tool usage, SOUL compliance, response quality, error handling. Vertex-mode deployments typically run 2 (Claude + Gemini via Vertex); direct-mode users typically run all 3
 4. **Consensus**: median scores + majority vote → pass/fail/partial
 5. **If failing**: analyzer finds patterns, patcher generates code fixes, sandbox validates (type-check + build)
 6. **Repeat** until pass rate ≥ threshold or budget exhausted
@@ -47,9 +52,16 @@ cp .env.example .env
 ### Requirements
 
 - [Bun](https://bun.sh/) runtime
-- At least one LLM API key (Claude preferred, Gemini/GPT optional for multi-judge consensus)
+- At least one judge configured — either:
+  - **Direct API**: an LLM API key (Claude preferred, Gemini / GPT optional for multi-judge consensus), or
+  - **Vertex AI**: `VERTEX_PROJECT_ID` + `VERTEX_REGION` plus the optional peer deps `@anthropic-ai/vertex-sdk` + `@google/genai`
 
 ### Environment Variables
+
+Paddock's Claude and Gemini judges run in one of two modes, auto-detected
+from environment. Pick whichever fits your deployment:
+
+#### Direct API mode (default for public users)
 
 ```bash
 # Required (at least one)
@@ -59,11 +71,67 @@ ANTHROPIC_API_KEY=sk-ant-...                    # Fallback
 # Optional (for 3-judge consensus)
 GEMINI_API_KEY=AIza...
 OPENAI_API_KEY=sk-...
+```
 
-# Optional overrides
+#### Vertex AI mode (for compliance-aligned / GCP-aligned deployments)
+
+When Vertex env is set, the Claude and Gemini judges skip API-key auth and
+authenticate via Google Cloud Application Default Credentials (`gcloud auth
+application-default login` locally, Workload Identity Federation in
+production). API keys are still required for the OpenAI judge — OpenAI has
+no Vertex offering.
+
+```bash
+# Required — both must be set to activate Vertex mode
+VERTEX_PROJECT_ID=your-gcp-project
+VERTEX_REGION=us-east5
+
+# Optional — declare the full Vertex judge panel as a comma-separated list
+# of model IDs (max 3 entries). Lets you run multiple Claude judges (e.g.
+# Sonnet + Opus) for 3-judge consensus without needing OpenAI. When unset,
+# paddock defaults to 1 Claude (EVAL_CLAUDE_JUDGE_MODEL) + 1 Gemini
+# (EVAL_GEMINI_JUDGE_MODEL).
+VERTEX_JUDGES=claude-sonnet-4-6,claude-opus-4-7,gemini-2.5-pro
+
+# Optional — adds an OpenAI judge alongside the Vertex ones (always direct).
+# Omit for FedRAMP-strict deployments that can't call api.openai.com.
+OPENAI_API_KEY=sk-...
+```
+
+The env-var names are deliberately platform-named (`VERTEX_*`) rather
+than vendor-named: in this mode Vertex hosts **both** judge providers
+(Claude via `@anthropic-ai/vertex-sdk`, Gemini via `@google/genai`), so a
+single platform-named env namespace gates both judges symmetrically.
+
+Provider for each entry in `VERTEX_JUDGES` is inferred from the model-name
+prefix: `claude-*` → Anthropic-on-Vertex, `gemini-*` → Google-on-Vertex.
+Putting a `gpt-*` model in the list errors fast at startup — OpenAI is
+not on Vertex; use `OPENAI_API_KEY` to add an OpenAI judge.
+
+Vertex mode requires installing two optional peer dependencies (paddock
+declares them as optional so direct-API users don't pay the install cost):
+
+```bash
+npm install @anthropic-ai/vertex-sdk @google/genai
+```
+
+#### Other overrides
+
+```bash
 EVAL_REPO_ROOT=/path/to/agent-repo
 EVAL_AGENT_DIR=/path/to/agent-repo/.agent
-EVAL_LLM_MODEL=claude-sonnet-4-20250514
+EVAL_LLM_MODEL=claude-sonnet-4-6
+EVAL_CLAUDE_JUDGE_MODEL=claude-sonnet-4-6
+EVAL_GEMINI_JUDGE_MODEL=gemini-2.5-pro
+EVAL_OPENAI_JUDGE_MODEL=gpt-4o
+
+# Judge tuning — applies to every judge (direct + Vertex)
+EVAL_JUDGE_THINKING_BUDGET=8000   # Reasoning tokens per call. 0 disables
+                                  # thinking on Claude/Gemini (OpenAI reasoning
+                                  # models clamp to "medium").
+EVAL_JUDGE_MAX_TOKENS=16000       # Max output tokens per judge call. Generous
+                                  # on purpose so thinking + final scored
+                                  # output fit on hard scenarios.
 ```
 
 ## Usage
@@ -259,26 +327,57 @@ bun run typecheck     # Type-check
 
 ### Adding a Judge Provider
 
-Create `src/evaluator/providers/your-provider.ts` implementing `JudgeProvider`:
+Three steps:
+
+**1.** Create `src/evaluator/providers/your-provider.ts` implementing `JudgeProvider`:
 
 ```typescript
-import type { JudgeProvider } from "../../types"
+import type { JudgeProvider, JudgePrompt, TokenUsage } from "../../types"
 
-export class YourProvider implements JudgeProvider {
+export class YourJudgeProvider implements JudgeProvider {
   name = "your-model"
   model: string
+  usage: TokenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
 
   constructor(apiKey: string, model = "your-model-id") {
     this.model = model
   }
 
-  async complete(prompt: string): Promise<string> {
-    // Call your LLM API, return raw text
+  async complete(prompt: string | JudgePrompt): Promise<string> {
+    // Call your LLM API, return raw text. Populate this.usage along the way.
   }
 }
 ```
 
-Register it in `src/evaluator/providers/factory.ts`.
+**2.** Add a variant to the `JudgeProviderConfig` discriminated union in `src/types.ts`:
+
+```typescript
+export interface YourJudgeConfig {
+  type: "your-provider"
+  model: string
+  apiKey: string
+}
+
+export type JudgeProviderConfig =
+  | ClaudeJudgeConfig
+  | ClaudeVertexJudgeConfig
+  | GeminiJudgeConfig
+  | GeminiVertexJudgeConfig
+  | OpenAIJudgeConfig
+  | YourJudgeConfig   // ← add here
+```
+
+**3.** Add a `case` to the factory's `switch` in `src/evaluator/providers/factory.ts`:
+
+```typescript
+case "your-provider":
+  return new YourJudgeProvider(config.apiKey, config.model)
+```
+
+TypeScript's exhaustive `never` check in the factory's `default` branch will flag any new variant that lacks a case at build time.
+
+To register the new judge from CLI / MCP based on env vars, mirror the
+`buildJudgeConfigs` pattern in `src/cli.ts` and `src/mcp/server.ts`.
 
 ### Runtime Integration
 

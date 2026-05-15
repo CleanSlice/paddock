@@ -7,6 +7,7 @@ import { saveReport } from "./report/writer"
 import { formatTokenUsage } from "./report/formatter"
 import type { EvalConfig, JudgeProviderConfig, ScenarioCategory, Difficulty } from "./types"
 import { DEFAULT_BLOCKED_TOOLS } from "./types"
+import { detectVertexMode, parseVertexJudges } from "./evaluator/providers/vertex-env"
 
 // ─── Helpers ─────────────────────────────────────────────────
 
@@ -52,16 +53,39 @@ ${bold("Options for 'scenarios':")}
   --count          Number to generate (default: 5)
 
 ${bold("Environment:")}
-  CLAUDE_CODE_OAUTH_TOKEN      Claude tokens, comma-separated for rotation (preferred)
-  ANTHROPIC_API_KEY            Claude API key (fallback)
-  GEMINI_API_KEY               Gemini judge (optional)
-  OPENAI_API_KEY               GPT judge (optional)
-  EVAL_REPO_ROOT               Override repo root
-  EVAL_AGENT_DIR               Override .agent dir
-  EVAL_LLM_MODEL               Agent LLM model (default: claude-sonnet-4-6)
-  EVAL_CLAUDE_JUDGE_MODEL      Claude judge model (default: claude-sonnet-4-6)
-  EVAL_GEMINI_JUDGE_MODEL      Gemini judge model (default: gemini-2.5-pro)
-  EVAL_OPENAI_JUDGE_MODEL      OpenAI judge model (default: gpt-4o)
+  Direct-API mode (default for public users):
+    CLAUDE_CODE_OAUTH_TOKEN    Claude tokens, comma-separated for rotation
+    ANTHROPIC_API_KEY          Claude API key (used if no OAuth token)
+    GEMINI_API_KEY             Gemini judge
+    OPENAI_API_KEY             GPT judge
+
+  Vertex AI mode (for compliance-aligned / GCP-aligned deployments —
+  Claude + Gemini judges run via Vertex; OpenAI judge keeps requiring
+  OPENAI_API_KEY since OpenAI is not on Vertex). Auth uses Application
+  Default Credentials.
+    VERTEX_PROJECT_ID          GCP project where Vertex AI is enabled
+    VERTEX_REGION              GCP region — e.g. us-east5
+    VERTEX_JUDGES              Optional. Comma-separated model IDs (max 3)
+                               that declare the full Vertex judge panel —
+                               e.g. "claude-sonnet-4-6,claude-opus-4-7,gemini-2.5-pro"
+                               for 3-judge consensus without OpenAI. Unset →
+                               defaults to 1 Claude + 1 Gemini.
+
+  Other:
+    EVAL_REPO_ROOT             Override repo root
+    EVAL_AGENT_DIR             Override .agent dir
+    EVAL_LLM_MODEL             Agent LLM model (default: claude-sonnet-4-6)
+    EVAL_CLAUDE_JUDGE_MODEL    Claude judge model (default: claude-sonnet-4-6)
+    EVAL_GEMINI_JUDGE_MODEL    Gemini judge model (default: gemini-2.5-pro)
+    EVAL_OPENAI_JUDGE_MODEL    OpenAI judge model (default: gpt-4o)
+
+  Judge tuning (applies uniformly to every judge — direct or Vertex):
+    EVAL_JUDGE_THINKING_BUDGET Reasoning tokens per judge call (default: 8000).
+                               Set 0 to disable thinking on Claude / Gemini;
+                               OpenAI reasoning models clamp to "medium".
+    EVAL_JUDGE_MAX_TOKENS      Max output tokens per judge call (default: 16000).
+                               Generous on purpose — leaves room for thinking
+                               blocks + final scored output on hard scenarios.
 `)
 }
 
@@ -86,27 +110,55 @@ function detectRepoRoot(): string {
 function buildJudgeConfigs(): JudgeProviderConfig[] {
   const configs: JudgeProviderConfig[] = []
 
-  // Prefer CLAUDE_CODE_OAUTH_TOKEN (supports comma-separated token rotation)
-  // Model override: EVAL_CLAUDE_JUDGE_MODEL (default: claude-sonnet-4-6)
-  const claudeKey = process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY
-  if (claudeKey) {
-    configs.push({
-      type: "claude",
-      model: process.env.EVAL_CLAUDE_JUDGE_MODEL ?? "claude-sonnet-4-6",
-      apiKey: claudeKey,
-    })
+  // Auth-mode selection: if Vertex env is set, register the Vertex variants
+  // for Claude + Gemini; otherwise register the direct-API variants when
+  // their keys are present. OpenAI has no Vertex equivalent and follows its
+  // own path. This is the only place in paddock that reads env vars to
+  // decide on auth mode — the provider classes downstream get fully-resolved
+  // typed configs and stay deterministic.
+  const vertex = detectVertexMode()
+  const claudeModel = process.env.EVAL_CLAUDE_JUDGE_MODEL ?? "claude-sonnet-4-6"
+  const geminiModel = process.env.EVAL_GEMINI_JUDGE_MODEL ?? "gemini-2.5-pro"
+
+  if (vertex) {
+    // VERTEX_JUDGES, when set, is a comma-separated list of model IDs that
+    // explicitly declares the Vertex-routed judge panel (e.g. Sonnet + Opus
+    // + Gemini for 3-judge consensus without OpenAI). When unset, paddock
+    // defaults to one Claude + one Gemini using EVAL_*_JUDGE_MODEL.
+    const explicitPanel = process.env.VERTEX_JUDGES?.trim()
+    if (explicitPanel) {
+      configs.push(...parseVertexJudges(explicitPanel, vertex))
+    } else {
+      configs.push({
+        type: "claude-vertex",
+        model: claudeModel,
+        projectId: vertex.projectId,
+        region: vertex.region,
+      })
+      configs.push({
+        type: "gemini-vertex",
+        model: geminiModel,
+        projectId: vertex.projectId,
+        region: vertex.region,
+      })
+    }
+  } else {
+    // Direct-API mode. Prefer CLAUDE_CODE_OAUTH_TOKEN (supports
+    // comma-separated rotation), fall back to ANTHROPIC_API_KEY.
+    const claudeKey = process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY
+    if (claudeKey) {
+      configs.push({ type: "claude", model: claudeModel, apiKey: claudeKey })
+    }
+    const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
+    if (geminiKey) {
+      configs.push({ type: "gemini", model: geminiModel, apiKey: geminiKey })
+    }
   }
 
-  // Model override: EVAL_GEMINI_JUDGE_MODEL (default: gemini-2.5-pro)
-  if (process.env.GEMINI_API_KEY) {
-    configs.push({
-      type: "gemini",
-      model: process.env.EVAL_GEMINI_JUDGE_MODEL ?? "gemini-2.5-pro",
-      apiKey: process.env.GEMINI_API_KEY,
-    })
-  }
-
-  // Model override: EVAL_OPENAI_JUDGE_MODEL (default: gpt-4o)
+  // OpenAI is always direct-API — Vertex has no OpenAI offering. Adding it
+  // alongside Vertex Claude+Gemini is a valid hybrid for deployments that
+  // accept the OpenAI direct path. FedRAMP-strict deployments simply omit
+  // OPENAI_API_KEY.
   if (process.env.OPENAI_API_KEY) {
     configs.push({
       type: "openai",
@@ -147,7 +199,9 @@ async function cmdRun(args: string[]) {
 
   const judgeConfigs = buildJudgeConfigs()
   if (judgeConfigs.length === 0) {
-    console.error(red("Error: No API keys found. Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY."))
+    console.error(red(
+      "Error: No judges configured. Set CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY for direct mode, or VERTEX_PROJECT_ID + VERTEX_REGION for Vertex mode.",
+    ))
     process.exit(1)
   }
 

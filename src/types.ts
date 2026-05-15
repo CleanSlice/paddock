@@ -217,9 +217,73 @@ export interface EvalConfig {
   concurrency: number          // max concurrent scenarios (default: 1 = sequential)
 }
 
-export interface JudgeProviderConfig {
-  type: "claude" | "gemini" | "openai"
+/**
+ * Configuration for a single judge LLM, including its auth mode.
+ *
+ * The `type` discriminator selects both the provider family and the auth
+ * path. Direct-API variants (`claude`, `gemini`, `openai`) require an
+ * `apiKey`. Vertex variants (`claude-vertex`, `gemini-vertex`) require
+ * `projectId` + `region` and authenticate via Google Cloud Application
+ * Default Credentials — no API key is read or accepted on those variants.
+ *
+ * OpenAI has no Vertex equivalent.
+ *
+ * Building the right variant from environment is the responsibility of
+ * paddock's entry points (`cli.ts`, `mcp/server.ts`); library consumers
+ * embed paddock by constructing these configs explicitly. The provider
+ * implementations themselves do not read environment variables — the auth
+ * mode is fully determined by the variant the caller passes in.
+ */
+export type JudgeProviderConfig =
+  | ClaudeJudgeConfig
+  | ClaudeVertexJudgeConfig
+  | GeminiJudgeConfig
+  | GeminiVertexJudgeConfig
+  | OpenAIJudgeConfig
+
+/** Claude via the direct Anthropic API. */
+export interface ClaudeJudgeConfig {
+  type: "claude"
   model: string
+  /** `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. Comma-separate to
+   * rotate across multiple tokens on rate-limit / auth failures. */
+  apiKey: string
+}
+
+/** Claude via Google Cloud Vertex AI. Auth via ADC/WIF (no API key). */
+export interface ClaudeVertexJudgeConfig {
+  type: "claude-vertex"
+  model: string
+  /** GCP project ID where the Vertex AI API is enabled. */
+  projectId: string
+  /** GCP region — e.g. `us-east5`. */
+  region: string
+}
+
+/** Gemini via the direct Google AI Studio API. */
+export interface GeminiJudgeConfig {
+  type: "gemini"
+  model: string
+  /** `GEMINI_API_KEY` or `GOOGLE_API_KEY`. */
+  apiKey: string
+}
+
+/** Gemini via Google Cloud Vertex AI. Auth via ADC/WIF (no API key). */
+export interface GeminiVertexJudgeConfig {
+  type: "gemini-vertex"
+  model: string
+  /** GCP project ID where the Vertex AI API is enabled. */
+  projectId: string
+  /** GCP region — e.g. `us-east5`. */
+  region: string
+}
+
+/** OpenAI / GPT via the direct OpenAI API. (No Vertex equivalent — OpenAI
+ *  is not hosted on Google Cloud Vertex AI.) */
+export interface OpenAIJudgeConfig {
+  type: "openai"
+  model: string
+  /** `OPENAI_API_KEY`. */
   apiKey: string
 }
 
